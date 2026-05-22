@@ -1,0 +1,25 @@
+# Secrets & credentials
+.env
+credentials.json
+token.json
+
+# Auth sessions (contains cookies/tokens — never commit)
+.session/
+
+# Python virtual environment
+.venv/
+
+# Temp / intermediate files
+.tmp/
+
+# Generated outputs
+output/
+
+# Internal tooling
+skillcreator/
+.claude/
+
+# Misc
+.DS_Store
+PromptCompressionTester.rtf
+__pycache__/
