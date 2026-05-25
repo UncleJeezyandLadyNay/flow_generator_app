@@ -1130,13 +1130,32 @@ def main():
             browser.close()
             sys.exit(1)
 
-        # ── Video-specific settings (mode switch + model + variation count) ──────
+        # ── Media-type settings (model selection + variation count) ──────────────
         if args.type == "video":
             select_video_model(page, "Veo 3.1 - Lite")
             set_variation_count(page, 1)
-            # Dismiss any dropdown/panel left open by the settings interactions
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(500)
+        else:
+            # Image mode: open the settings panel to access the variation buttons,
+            # set to 1, then close. The panel opener is the "Nano Banana 2" button.
+            image_panel_opened = False
+            for loc in [
+                page.locator("button", has_text=re.compile(r"nano.?banana|🍌", re.I)),
+                page.get_by_role("button", name=re.compile(r"nano.?banana|🍌", re.I)),
+            ]:
+                try:
+                    if loc.count() > 0 and loc.first.is_visible():
+                        loc.first.click()
+                        page.wait_for_timeout(800)
+                        image_panel_opened = True
+                        log("Opened image settings panel")
+                        break
+                except Exception:
+                    continue
+            if image_panel_opened:
+                set_variation_count(page, 1)
+        # Dismiss any open panel/dropdown before generating
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(500)
 
         # ── Install network interceptor before generating ──────────────────────
         intercepted: list[str] = []
