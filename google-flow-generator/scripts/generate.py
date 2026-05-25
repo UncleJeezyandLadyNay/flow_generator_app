@@ -298,8 +298,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--headless",
         action="store_true",
-        default=True,
-        help="Run headless (default: True). Use --no-headless to watch.",
+        default=False,
+        help="Run headless (default: False). Google Flow detects and blocks standard headless "
+             "Chrome — prefer the default headed mode. Use --headless to try Chrome's new "
+             "headless mode, which is harder to detect.",
     )
     parser.add_argument("--no-headless", dest="headless", action="store_false")
     parser.add_argument(
@@ -619,57 +621,74 @@ GENERATED_URL_PATTERNS = re.compile(
 SKIP_URL_PATTERNS = re.compile(
     r"gstatic\.com|/banner|/icon|/logo|favicon|sprite|placeholder|"
     r"fonts\.google|analytics|gtag|recaptcha|"
-    r"aisandbox-pa\.googleapis\.com|"  # API/JSON endpoints, not media files
     r"labs\.google/fx/images/|perlin",  # Flow UI background textures
     re.I,
 )
+# Only skip aisandbox JSON endpoints — not actual media responses from that domain
+SKIP_JSON_ONLY_PATTERNS = re.compile(r"aisandbox-pa\.googleapis\.com", re.I)
 
 
-def install_response_interceptor(page, collected: list, media_type: str) -> None:
+def install_response_interceptor(page, collected: list, media_type: str,
+                                  video_urls: list | None = None) -> None:
     """
     Listen for network responses that look like generated media.
     Appends matching URLs to `collected`.
+    Confirmed video/* responses are also appended to `video_urls` (if provided).
 
-    Four capture paths:
-    1. Any flow-content.google URL in the response URL itself.
-    2. Content-type match (image/* or video/*) for direct media responses.
-    3. URL pattern match (.mp4/.webm/.png etc, or keywords like "generated").
-    4. JSON body scan — Flow delivers generated media URLs inside JSON API
-       responses (e.g. aisandbox-pa.googleapis.com). Parse the body and
-       extract any flow-content.google URLs found inside.
+    Five capture paths:
+    1. video/* content-type — always captured regardless of domain.
+    2. Any flow-content.google URL in the response URL itself.
+    3. Content-type match (image/*) for direct media responses.
+    4. URL pattern match (.mp4/.webm/.png etc, or keywords like "generated").
+    5. JSON body scan — Flow delivers generated media URLs inside JSON API
+       responses. Parse the body and extract embedded media URLs.
     """
-    # Pattern to find flow-content.google URLs anywhere inside a JSON body
-    FLOW_URL_IN_BODY = re.compile(
-        r'https://flow-content\.google/[^\s"\']+', re.I
-    )
+    FLOW_URL_IN_BODY = re.compile(r'https://flow-content\.google/[^\s"\']+', re.I)
+    MP4_IN_BODY      = re.compile(r'https://[^\s"\'\\]+\.(?:mp4|webm)[^\s"\'\\]*', re.I)
 
     def on_response(response):
         try:
             url = response.url
             ct = response.headers.get("content-type", "")
 
-            # Path 1–3: direct URL / content-type / extension matching
-            if not SKIP_URL_PATTERNS.search(url):
-                is_flow_cdn   = MEDIA_CDN_PATTERNS.search(url)
-                is_media_type = ("image/" in ct) or ("video/" in ct)
-                is_media_url  = GENERATED_URL_PATTERNS.search(url)
-                if (is_flow_cdn or is_media_type or is_media_url) and url not in collected:
+            # Path 1: always capture any video/* response — never filter by domain.
+            # Flow may serve video files from aisandbox-pa.googleapis.com or other
+            # domains not in MEDIA_CDN_PATTERNS.
+            if "video/" in ct:
+                if url not in collected:
+                    log(f"  [net] Video captured: {url[:100]}  ct={ct[:40]}")
+                    collected.append(url)
+                if video_urls is not None and url not in video_urls:
+                    video_urls.append(url)
+                return
+
+            # Path 2–4: domain-filtered image / CDN / extension matching.
+            # aisandbox-pa.googleapis.com normally serves JSON API responses; skip those.
+            # But if it returns image/* content, it's a real generated image — allow it.
+            is_media_ct = "image/" in ct  # video/* is already handled in Path 1
+            skip        = SKIP_URL_PATTERNS.search(url) or (
+                SKIP_JSON_ONLY_PATTERNS.search(url) and not is_media_ct
+            )
+            if not skip:
+                is_flow_cdn  = MEDIA_CDN_PATTERNS.search(url)
+                is_media_url = GENERATED_URL_PATTERNS.search(url)
+                if (is_flow_cdn or is_media_ct or is_media_url) and url not in collected:
                     log(f"  [net] Candidate: {url[:100]}  ct={ct[:40]}")
                     collected.append(url)
 
-            # Path 4: scan JSON bodies for embedded flow-content.google URLs
-            # Covers googleapis.com API responses that return the CDN URL in JSON
-            if "json" in ct and (
-                "googleapis.com" in url or
-                "labs.google" in url or
-                "flow" in url.lower()
-            ):
+            # Path 5: scan JSON bodies for embedded media URLs
+            if "json" in ct:
                 try:
                     body = response.text()
                     for match in FLOW_URL_IN_BODY.finditer(body):
                         found_url = match.group(0).rstrip('\\",}]')
                         if found_url not in collected:
                             log(f"  [net] Found in JSON body: {found_url[:100]}")
+                            collected.append(found_url)
+                    for match in MP4_IN_BODY.finditer(body):
+                        found_url = match.group(0).rstrip('\\",}]')
+                        if found_url not in collected:
+                            log(f"  [net] Found mp4 in JSON body: {found_url[:100]}")
                             collected.append(found_url)
                 except Exception:
                     pass
@@ -679,9 +698,20 @@ def install_response_interceptor(page, collected: list, media_type: str) -> None
     page.on("response", on_response)
 
 
+FLOW_BASE = "https://labs.google"
+
+
+def make_absolute(url: str) -> str:
+    """Resolve a relative /path URL to an absolute https://labs.google/path URL."""
+    if url and url.startswith("/"):
+        return FLOW_BASE + url
+    return url
+
+
 def wait_for_result(page, media_type: str, timeout_sec: int,
                     pre_urls: set | None = None,
-                    intercepted: list | None = None) -> str | None:
+                    intercepted: list | None = None,
+                    video_urls: list | None = None) -> str | None:
     """
     Poll the DOM for a completed generation result.
     Returns a URL to the generated media, or None on timeout.
@@ -700,8 +730,17 @@ def wait_for_result(page, media_type: str, timeout_sec: int,
         elapsed = int(time.time() - (deadline - timeout_sec))
         log(f"  Still waiting... ({elapsed}s elapsed)")
 
-        # Primary: check network-intercepted URLs — prefer known media CDNs first
         elapsed_so_far = time.time() - (deadline - timeout_sec)
+
+
+        # 0th pass (video only): confirmed video/* network responses — highest confidence,
+        # captured from any CDN domain (e.g. aisandbox-pa.googleapis.com, flow-content.google).
+        if media_type == "video" and video_urls and elapsed_so_far >= min_result_wait:
+            if video_urls:
+                log(f"  [net] Returning confirmed video URL: {video_urls[0][:80]}")
+                return video_urls[0]
+
+        # Primary: check network-intercepted URLs — prefer known media CDNs first
         if intercepted and elapsed_so_far >= min_result_wait:
             # 1st pass: flow-content.google CDN URLs, filtered to the right media type
             for url in list(intercepted):
@@ -719,27 +758,76 @@ def wait_for_result(page, media_type: str, timeout_sec: int,
                         return url
                     if media_type == "image" and re.search(r"\.(png|jpg|jpeg|webp|gif)", url, re.I):
                         return url
+            # 3rd pass (image only): any intercepted URL from a googleapis.com domain
+            # — aisandbox-pa may serve generated images with opaque URL paths (no extension).
+            if media_type == "image":
+                for url in list(intercepted):
+                    if not SKIP_URL_PATTERNS.search(url) and "googleapis.com" in url:
+                        return url
 
         if media_type == "video":
-            # Primary: find <video src="*media.getMediaUrlRedirect*"> elements and
-            # follow their redirect. The redirect serves image/jpeg while rendering
-            # and switches to video/mp4 when the video is fully generated.
+            # Primary: check whether any <video> element has loaded real video data.
+            # video.duration > 0 means the browser decoded actual video frames, not
+            # just a thumbnail poster — this is the most reliable "generation done" signal.
+            try:
+                video_info = page.evaluate("""() => {
+                    const videos = [...document.querySelectorAll('video')];
+                    for (const v of videos) {
+                        if ((v.duration > 0 || (v.readyState >= 2 && v.videoWidth > 0)) && v.src) {
+                            return {src: v.src, currentSrc: v.currentSrc || v.src,
+                                    duration: v.duration, readyState: v.readyState,
+                                    videoWidth: v.videoWidth};
+                        }
+                    }
+                    return null;
+                }""")
+                if video_info and (video_info.get("duration", 0) > 0 or
+                                   video_info.get("readyState", 0) >= 2):
+                    vsrc = video_info.get("currentSrc") or video_info.get("src", "")
+                    log(f"  [dom] Video loaded (duration={video_info.get('duration',0):.1f}s "
+                        f"readyState={video_info.get('readyState')} width={video_info.get('videoWidth')})")
+                    if vsrc:
+                        vsrc = make_absolute(vsrc)
+                        # For media.getMediaUrlRedirect URLs, send Accept: video/* so the
+                        # server returns the video redirect instead of the jpeg thumbnail.
+                        video_accept = {"Accept": "video/mp4,video/webm,video/*;q=0.9,*/*;q=0.8"}
+                        if "media.getMediaUrlRedirect" in vsrc:
+                            try:
+                                resp = page.context.request.get(vsrc, headers=video_accept)
+                                ct = resp.headers.get("content-type", "")
+                                final = resp.url
+                                if "video" in ct or re.search(r"\.(mp4|webm)", final, re.I):
+                                    log(f"  [dom] Redirect → video: {final[:80]}")
+                                    return final
+                                log(f"  [dom] Video ready (browser) but redirect ct={ct!r} — "
+                                    f"returning redirect URL for download")
+                                return vsrc
+                            except Exception as exc:
+                                log(f"  [dom] Redirect follow failed ({exc}) — using src directly")
+                                return vsrc
+                        return vsrc
+            except Exception:
+                pass
+
+            # Secondary: find <video src="*media.getMediaUrlRedirect*"> and follow with
+            # correct Accept header so the server serves the video instead of the thumbnail.
             try:
                 video_srcs = page.evaluate("""() =>
                     [...document.querySelectorAll('video[src*="media.getMediaUrlRedirect"]')]
                         .map(v => v.src).filter(s => s.length > 0)
                 """)
+                video_accept = {"Accept": "video/mp4,video/webm,video/*;q=0.9,*/*;q=0.8"}
                 for redirect_url in (video_srcs or []):
+                    redirect_url = make_absolute(redirect_url)
                     try:
-                        resp = page.context.request.get(redirect_url)
+                        resp = page.context.request.get(redirect_url, headers=video_accept)
                         ct = resp.headers.get("content-type", "")
                         final_url = resp.url
                         if "video" in ct or re.search(r"\.(mp4|webm)", final_url, re.I):
                             log(f"  [dom] Video redirect resolved: {final_url[:80]}")
-                            return final_url  # the actual CDN video URL
-                        # Still an image — log once at 30s mark to avoid spam
+                            return final_url
                         if elapsed_so_far > 30 and elapsed_so_far % 30 < poll_interval:
-                            log(f"  [dom] Redirect still serving image ({ct}) — video not ready yet")
+                            log(f"  [dom] Redirect still serving {ct!r} — video not ready yet")
                     except Exception:
                         pass
             except Exception:
@@ -767,21 +855,37 @@ def wait_for_result(page, media_type: str, timeout_sec: int,
         elif media_type == "image":
             try:
                 imgs = page.locator("img[src]")
+                all_srcs = []
                 for i in range(imgs.count()):
                     src = imgs.nth(i).get_attribute("src") or ""
+                    all_srcs.append(src)
+                    # Always check media.getMediaUrlRedirect — these are generated images
+                    if "media.getMediaUrlRedirect" in src:
+                        abs_src = make_absolute(src)
+                        if not pre_urls or src not in pre_urls:
+                            log(f"  [dom] Generated image URL: {abs_src[:80]}")
+                            return abs_src
+                        # URL is in pre_urls — follow redirect to check if it's a real image
+                        try:
+                            resp = page.context.request.get(abs_src)
+                            if "image/" in resp.headers.get("content-type", "") and resp.ok:
+                                log(f"  [dom] Image redirect resolved: {resp.url[:80]}")
+                                return resp.url
+                        except Exception:
+                            pass
+                        continue
                     # Skip URLs that existed before we clicked generate
                     if pre_urls and src in pre_urls:
                         continue
-                    # Skip known Google static asset CDNs and paths
-                    low = src.lower()
                     if not src.startswith("https://"):
                         continue
+                    low = src.lower()
                     if any(d in low for d in ["gstatic.com", "logo", "icon", "banner",
                                               "favicon", "sprite", "placeholder", "/assets/"]):
                         continue
                     if len(src) < 50:
                         continue
-                    return src
+                    return make_absolute(src)
             except Exception:
                 pass
 
@@ -803,8 +907,12 @@ def wait_for_result(page, media_type: str, timeout_sec: int,
                 pass
 
     log("ERROR: Timed out waiting for generation result.")
+    if video_urls:
+        log(f"  Confirmed video URL(s) intercepted ({len(video_urls)}):")
+        for u in video_urls:
+            log(f"    {u[:120]}")
     if intercepted:
-        log(f"  Intercepted {len(intercepted)} URL(s) during wait:")
+        log(f"  All intercepted URL(s) ({len(intercepted)}):")
         for u in intercepted:
             log(f"    {u[:120]}")
     else:
@@ -842,9 +950,14 @@ def download_result(url: str, media_type: str, out_dir: Path, page, name: str | 
         out_path = out_dir / f"{stem}.{ext}"
         out_path.write_bytes(base64.b64decode(data_b64))
     else:
-        # Use Playwright's request context — bypasses CORS, carries session cookies
+        # Use Playwright's request context — bypasses CORS, carries session cookies.
+        # For media.getMediaUrlRedirect URLs, send Accept: video/* so the server
+        # redirects to the video file rather than the jpeg thumbnail.
+        extra_headers = {}
+        if media_type == "video" and "media.getMediaUrlRedirect" in url:
+            extra_headers = {"Accept": "video/mp4,video/webm,video/*;q=0.9,*/*;q=0.8"}
         log(f"Downloading via Playwright request: {url[:80]}...")
-        response = page.context.request.get(url)
+        response = page.context.request.get(url, headers=extra_headers)
         if not response.ok:
             raise RuntimeError(f"Download failed: HTTP {response.status} for {url[:80]}")
         # Determine extension from Content-Type header
@@ -911,27 +1024,36 @@ def main():
         print("Run:  .venv/bin/pip install playwright && .venv/bin/playwright install chromium", file=sys.stderr)
         sys.exit(1)
 
+    # Google Flow detects and blocks standard headless Chrome (--headless flag).
+    # --headless=new uses Chrome's modern headless mode which shares the same renderer
+    # as headed Chrome, making it much harder to detect as automation.
+    # We pass headless=False to Playwright (so it doesn't add the old --headless flag)
+    # and add --headless=new ourselves when the user requests headless mode.
+    launch_headless = False  # always False — we control headless via launch_args
     launch_args = [
         "--disable-blink-features=AutomationControlled",
-        *( ["--start-maximized"] if not args.headless else [] ),
+        *( ["--headless=new"] if args.headless else ["--start-maximized"] ),
     ]
 
     with sync_playwright() as p:
         try:
             browser = p.chromium.launch(
-                headless=args.headless,
+                headless=launch_headless,
                 channel="chrome",
                 args=launch_args,
             )
         except Exception:
             browser = p.chromium.launch(
-                headless=args.headless,
+                headless=launch_headless,
                 args=launch_args,
             )
 
+        # In --headless=new mode, Chrome has no display server.
+        # Set an explicit viewport so the page renders at a predictable size.
+        viewport = {"width": 1920, "height": 1080} if args.headless else None
         context = browser.new_context(
             storage_state=storage_state,
-            viewport=None,
+            viewport=viewport,
             java_script_enabled=True,
         )
         context.add_init_script(
@@ -1018,7 +1140,9 @@ def main():
 
         # ── Install network interceptor before generating ──────────────────────
         intercepted: list[str] = []
-        install_response_interceptor(page, intercepted, args.type)
+        video_urls:  list[str] = []
+        install_response_interceptor(page, intercepted, args.type, video_urls)
+
 
         # ── Generate with retry on quota errors ────────────────────────────────
         result_url = None
@@ -1027,6 +1151,7 @@ def main():
                 log(f"Retry {attempt - 1}/{args.retries} after {args.retry_delay}s...")
                 time.sleep(args.retry_delay)
                 intercepted.clear()
+                video_urls.clear()
 
             prompt_input.click()
             # Clear any existing content then type the prompt.
@@ -1055,7 +1180,8 @@ def main():
             log(f"Generate clicked (attempt {attempt}). Waiting for result...")
 
             result_url = wait_for_result(page, args.type, args.timeout,
-                                         pre_urls=pre_urls, intercepted=intercepted)
+                                         pre_urls=pre_urls, intercepted=intercepted,
+                                         video_urls=video_urls)
 
             if result_url == "QUOTA_ERROR":
                 if attempt <= args.retries:
